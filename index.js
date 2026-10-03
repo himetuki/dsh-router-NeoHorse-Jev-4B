@@ -760,19 +760,29 @@ export function apply(ctx, config) {
   const modeSink = { mode: auto ? 'auto' : 'manual' };
   /** True when the user switched to manual: leave the request on the config its own owner chose. */
   const isManual = () => currentMode(ctx, modeSink.mode) === 'manual';
+  /** In-memory judgment history served to the tier chip (the remote judge keeps no local service). */
+  const judgeLog = [];
+  let lastJudgmentOk = true;
+  const judgeState = {
+    read() {
+      const sessions = {};
+      for (const row of judgeLog) {
+        (sessions[row.sessionId] ||= []).push(row);
+      }
+      return { sessions, available: lastJudgmentOk };
+    },
+  };
 
   if (auto) {
     log(`auto tier per turn; tiers low=${routeLabel(tiers.low)} `
       + `high=${routeLabel(tiers.high)} max=${routeLabel(tiers.max)} `
       + `fallback=${routeLabel(tiers.fallback)}`);
-    // Bring the judge up in the background so mounting the row is all a user has to do. NOT awaited:
-    // an 807 MB CPU checkpoint load must never sit in front of DSH's boot, and `judgeTier` already
-    // fails safe per turn while it is still coming up. `autoStart: false` opts out for anyone who
-    // runs the service some other way.
+    // The judge is remote (TokenRhythm System One), so there is no local service to bring up; this
+    // logs the ready state without blocking boot, and `judgeTier` fails safe per turn anyway.
     Promise.resolve()
       .then(() => ensureJudgeService(cfg))
       .then((outcome) => { log(`judge service: ${outcome}`); })
-      .catch((e) => { log(`judge service: auto-start skipped (${e.message})`); });
+      .catch((e) => { log(`judge service: ready check skipped (${e.message})`); });
     // The runtime switch. Not awaited either: registering it must not delay the row, and the read
     // path already falls back to `modeFallback` until the registration lands.
     installModeSetting(ctx, 'auto', modeSink).then((settings) => {
@@ -805,18 +815,6 @@ export function apply(ctx, config) {
    * the tier we served and the task text we served it for, feeding the next turn's
    * prev_tier/prev_task (regenerate detection + C3 escalation). */
   const sessionState = new Map();
-  /** In-memory judgment history served to the tier chip (the remote judge keeps no local service). */
-  const judgeLog = [];
-  let lastJudgmentOk = true;
-  const judgeState = {
-    read() {
-      const sessions = {};
-      for (const row of judgeLog) {
-        (sessions[row.sessionId] ||= []).push(row);
-      }
-      return { sessions, available: lastJudgmentOk };
-    },
-  };
   const keyOf = (payload) => {
     const session = payload && payload.agent && payload.agent.session;
     return (session && (session.id || session.sessionId)) || 'global';
