@@ -1,5 +1,6 @@
 /**
- * Tier chip — browser half of `dsh-router-laya` (spec: docs/frontend-auto-tier-spec.md).
+ * Tier chip — browser half of `dsh-router-neohorse` (adapted from dsh-router-laya; the judge is now
+ * the TokenRhythm NeoHorse-Jev-4B decision call).
  *
  * Packaged as the client module system's lazy-CJS bundle: executing this file only REGISTERS a factory,
  * the module body runs at first materialization, and every side effect (including the stylesheet) lives
@@ -9,7 +10,7 @@
  * literal value cannot be used as written are marked ADAPTED below with the reason.
  */
 window.__ModuleLoader__.load({
-  id: "dsh-router-laya",
+  id: "dsh-router-neohorse",
   factory: (require) => {
     var module = { exports: {} }
     var exports = module.exports
@@ -18,10 +19,12 @@ window.__ModuleLoader__.load({
     const React = require("react")
 
     // ── spec §2/§3/§4/§5 constants ────────────────────────────────────────────────────────────────
-    const STATE_URL = "http://127.0.0.1:8765/state"
+    // The judgment history is served same-origin by the host half (the remote judge keeps no local
+    // service), like the mode switch below.
+    const STATE_URL = "/router-neohorse/state"
     // Same-origin, unlike /state: a static client bundle has no `host.call` and no `ctx.remote.settings`,
     // so the host half serves this route to read and switch the mode.
-    const MODE_URL = "/router-laya/mode"
+    const MODE_URL = "/router-neohorse/mode"
     const POLL_MS = 3000
     const POLL_FAILURES_BEFORE_OFFLINE = 2
     const TOAST_MS = 2000
@@ -37,7 +40,7 @@ window.__ModuleLoader__.load({
     const TIER_SHORT = { low: "低", high: "高", max: "MAX" }
     const OFFLINE_COLOR = "#8b949e"
     const OFFLINE_TEXT = "AUTO · 离线"
-    const OFFLINE_TIP = "判定服务未启动 · 已落 low（powershell -File routing/start_router.ps1）"
+    const OFFLINE_TIP = "判定不可用 · 已落 low（检查网络与基元律动凭据）"
     // The spec's five states do not cover "the service is healthy but nothing has been judged yet", which
     // is the real state on every fresh load: /state's log is in-memory and empty until this session's
     // first turn is judged. Showing the offline copy there claims a failure that is not happening.
@@ -52,7 +55,7 @@ window.__ModuleLoader__.load({
       intent_exclude: "按你的要求排除",
     }
     const REASON_TEXT = {
-      laya: "内容判断",
+      neohorse: "NeoHorse 判断",
       escalate_regenerate: "检测到重试·升档",
       intent_force: "用户指定",
       intent_inherit: "保持上轮",
@@ -179,7 +182,7 @@ window.__ModuleLoader__.load({
     // ── spec §4 toast copy ───────────────────────────────────────────────────────────────────────
     function toastText(triggeredBy, nextTier, prevTier) {
       if (Object.prototype.hasOwnProperty.call(TOAST_TEXT, triggeredBy)) return TOAST_TEXT[triggeredBy]
-      if (triggeredBy === "laya") {
+      if (triggeredBy === "neohorse") {
         const next = TIER_ORDER[nextTier]
         const prev = TIER_ORDER[prevTier]
         if (next === undefined || prev === undefined) return null
@@ -410,7 +413,7 @@ window.__ModuleLoader__.load({
     function apply(ctx) {
       if (styleEl === null) {
         styleEl = document.createElement("style")
-        styleEl.setAttribute("data-router-laya", "tier-chip")
+        styleEl.setAttribute("data-router-neohorse", "tier-chip")
         styleEl.textContent = CSS
         document.head.appendChild(styleEl)
       }
@@ -421,14 +424,14 @@ window.__ModuleLoader__.load({
         styleEl = null
       })
       ctx.slots.inject("conversation.input.right", () => ctx.slots.register(
-        { name: "conversation.input.right", id: "router-laya-tier", order: 5 },
+        { name: "conversation.input.right", id: "router-neohorse-tier", order: 5 },
         (slotProps) => React.createElement(Chip, {
           sessionId: slotProps === undefined || slotProps === null ? undefined : slotProps.sessionId,
         }),
       ))
     }
 
-    exports.name = "router-laya-client"
+    exports.name = "router-neohorse-client"
     exports.inject = ["slots"]
     exports.apply = apply
     return module.exports

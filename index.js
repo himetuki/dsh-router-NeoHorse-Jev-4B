@@ -26,34 +26,16 @@
  * plugin writing there would corrupt it.
  */
 
-export const name = 'router-laya';
+export const name = 'router-neohorse';
 
-// No `llm` inject needed: the judge calls a local Laya HTTP router instead of an LLM service.
-export const inject = [];
+// The judge is a remote System One decision call (TokenRhythm NeoHorse-Jev-4B). The API key is
+// resolved by reference through DSH's `credentials` service -- the plugin never reads the key itself.
+export const inject = ['credentials'];
 
-// Node builtins only. These are for the judge service's auto-start (see SERVICE_* below), not for
-// routing. `@deepseek-ai/schemastery` is a peer the profile provides: bare it only resolves once the
-// package sits under a `node_modules` that reaches the harness (see install.mjs) -- a checkout needs
-// its own `node_modules/@deepseek-ai/schemastery` (gitignored) or a copy-install.
-import { closeSync, existsSync as fsExists, openSync } from 'node:fs';
-import { spawn } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { dirname as pathDirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+// Node builtins + schemastery only. The judge is a remote System One call, so there is no local
+// service to spawn or health-check. `@deepseek-ai/schemastery` is a peer the profile provides:
+// bare it only resolves once the package sits under a `node_modules` that reaches the harness.
 import z from '@deepseek-ai/schemastery';
-
-/** This file's directory -- the starting point for the dev-checkout search in `serviceLaunchSpec`. */
-const hereDir = pathDirname(fileURLToPath(import.meta.url));
-
-/**
- * Where a judge we spawned writes its own diagnostics.
- *
- * Measured the hard way (2026-09-25): with `stdio: 'ignore'` a spawn that dies -- here, the sandbox
- * refusing the port bind -- leaves *nothing* to look at, just a 90s wait and a "never answered" line.
- * The child's stderr is the only place its real reason exists, so keep it. Constant rather than
- * per-port, exactly like the handoff's `start_router.ps1` (`$env:TEMP/laya_router.err.log`).
- */
-const SERVICE_LOG_PATH = `${tmpdir()}/laya-router-service.log`;
 
 const DEFAULT_PROVIDER = 'deepseek-official';
 
@@ -79,10 +61,16 @@ export const ROUTE_TABLE = {
   fallback: { provider: DEFAULT_PROVIDER, model: 'deepseek-flash', effort: 'low' },
 };
 
-/** The judge's route is now the local Laya HTTP router, not an LLM call. */
-const JUDGE_TIMEOUT_MS = 20000;
+/** Judge defaults: the TokenRhythm System One endpoint and its NeoHorse-Jev-4B decision model. */
+const DEFAULT_JUDGE_BASE_URL = 'https://tokenrhythm.studio/v1/systemone';
+const DEFAULT_JUDGE_MODEL = 'NeoHorse-Jev-4B';
+const DEFAULT_CREDENTIAL_REF = 'JEV_API_KEY';
+const JUDGE_TIMEOUT_MS = 30000;
 /** Task text is truncated before it reaches the judge. */
 const JUDGE_MAX_CHARS = 4000;
+/** Tier and reason vocabularies the System One judge may answer with. */
+const TIER_OPTIONS = ['low', 'high', 'max'];
+const REASON_OPTIONS = ['content', 'intent_force', 'intent_inherit', 'intent_exclude', 'escalate_regenerate'];
 
 /**
  * The runtime mode switch (2026-09-25).
@@ -102,7 +90,7 @@ const JUDGE_MAX_CHARS = 4000;
  * routing runs at all; the *tier table* selects where a judged tier lands. Only the first is a user
  * preference, so only the first is in settings.
  */
-export const MODE_NS = 'router-laya';
+export const MODE_NS = 'router-neohorse';
 /** `auto` routes every turn; `manual` leaves every request exactly as its owner configured it. */
 export const MODES = ['manual', 'auto'];
 
@@ -118,21 +106,22 @@ export const Config = z.object({
   routes: z.any(),
   tiers: z.any(),
   global: z.boolean(),
-  servicePython: z.string(),
-  serviceScript: z.string(),
-  autoStart: z.boolean(),
+  baseUrl: z.string().default(DEFAULT_JUDGE_BASE_URL),
+  model: z.string().default(DEFAULT_JUDGE_MODEL),
+  credentialRef: z.string().default(DEFAULT_CREDENTIAL_REF),
+  timeoutMs: z.number().default(JUDGE_TIMEOUT_MS),
 });
 
 /**
  * The loader entry id that owns this plugin's Config. It is not stable across install paths:
- * a hand-patched row uses `router-laya`, while a bundle insert uses `include:router-laya`, and
- * `settings.update` addresses entries by that id (not by package name). Empty input falls back
+ * a hand-patched row uses `router-neohorse`, while a bundle insert uses `include:router-neohorse`,
+ * and `settings.update` addresses entries by that id (not by package name). Empty input falls back
  * so callers can still attempt a write and surface a precise 503.
  */
 export function resolveModeEntryId(entries, fallback = MODE_NS) {
   for (const entry of entries ?? []) {
     const options = entry !== undefined && entry !== null ? entry.options : undefined;
-    if (options !== undefined && options !== null && options.name === 'dsh-router-laya'
+    if (options !== undefined && options !== null && options.name === 'dsh-router-neohorse'
       && typeof options.id === 'string' && options.id !== '') return options.id;
   }
   return fallback;
@@ -263,7 +252,7 @@ function installModeRoute(ctx, sink) {
   if (webServer === undefined || webServer === null) return;
   scoped.effect(() => webServer.register({
     kind: 'exact',
-    path: '/router-laya/mode',
+    path: '/router-neohorse/mode',
     handler: (req, res) => {
       const send = (code, body) => {
         const text = JSON.stringify(body);
@@ -323,43 +312,36 @@ function installModeRoute(ctx, sink) {
 }
 
 /**
- * Service auto-start (distribution, 2026-09-25).
+ * Serve the tier chip's judgment log over the web carrier, same-origin.
  *
- * The other plugins in a profile are pure Node, so mounting the row IS starting them and there is
- * nothing to keep alive. This one is a *pair*: the row is the thin in-process half, and the judge is a
- * separate Python process holding an 807 MB checkpoint. Until now the user had to run
- * `routing/start_router.ps1` by hand before every session, which is exactly the kind of step that
- * silently does not happen -- measured live: the plugin was mounted and byte-identical to this source
- * while `/health` refused connections, so every turn paid the full 20s timeout and fell back to low
- * with nothing on screen to say why.
+ * The remote judge keeps no local service, so the host half owns the in-memory history the chip
+ * polls (the old Python `/state` server is gone).
  *
- * So mounting the row also brings the service up, when it can find one. Deliberate properties:
- *
- *   - OFF the request path. The spawn happens once at apply() and never delays or fails a turn; a
- *     service that is still loading just means the next turns take the existing fallback until it
- *     answers. `fail-safe` is unchanged.
- *   - Never fatal. A missing python, a missing script, a dead spawn: log a line and return. The
- *     session must not learn that the judge is unhappy.
- *   - Idempotent, and duplicated starts are already safe: `laya_router.py` binds 127.0.0.1:8765, so a
- *     second process dies on EADDRINUSE and exits. Two DSH instances therefore cannot both own it --
- *     the loser exits rather than fighting for the port.
- *   - Detached, stdio ignored: the judge must outlive nothing in particular and must not hold a pipe
- *     to the harness. It is a plain background process, killed the way any other one is.
- *
- * Discovery is ordered and silent: `cfg.servicePython`/`cfg.serviceScript` win, then a dev checkout
- * (walking up from this file for the shipped venv and the `training/laya_router_finetuned` that only
- * the repo has), and if neither resolves we do not guess -- we log and leave the pass-through alone.
- * A packaged install is expected to point these at its own `service/` directory.
+ *   GET -> `{sessions: { <sessionId>: [{ts, tier, triggered_by, task}] }}`
  */
-const SERVICE_HEALTH_TIMEOUT_MS = 700;
-/** How long a cold start may take before we stop looking. CPU checkpoint load measured ~2s here. */
-const SERVICE_START_TIMEOUT_MS = 90000;
+function installStateRoute(ctx, state) {
+  ctx.inject(['webServer'], (scoped) => {
+    const webServer = scoped.get('webServer');
+    if (webServer === undefined || webServer === null) return;
+    scoped.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/router-neohorse/state',
+      handler: (req, res) => {
+        const text = JSON.stringify(state.read());
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Length', String(Buffer.byteLength(text)));
+        res.end(text);
+      },
+    }));
+  });
+}
 
 /**
  * Tier -> route for AUTO mode (plugin v2, docs/plugin-v2-plan.md §3.3).
  *
  * Deliberately a different table from ROUTE_TABLE: v2 is the product path (none -> tier via the
- * fine-tuned 7-question judge), while ROUTE_TABLE serves the v1 judge experiment (hard -> qwen
+ * System One judge), while ROUTE_TABLE serves the v1 judge path (hard -> qwen
  * xhigh). The two stay separate so experiment baselines remain comparable. `max` is legal on
  * deepseek-official -- the adapter's `resolveThinking` accepts off|low|high|max (verified in the
  * dsh-llm-deepseek source). A preset re-points rows via its own `tiers` config, mirroring
@@ -514,7 +496,7 @@ function routeLabel(route) {
 }
 
 function log(message) {
-  process.stderr.write(`[router-laya] ${message}\n`);
+  process.stderr.write(`[router-neohorse] ${message}\n`);
 }
 
 /** Flatten one message's text blocks; returns '' when it carries none. */
@@ -527,93 +509,190 @@ function textOf(message) {
 }
 
 /**
- * Ask the Laya router (HTTP) for one difficulty level.
+ * Ask the System One judge (HTTP) for one difficulty level (v1 / `judge` mode).
  *
- * The Laya router runs as a separate Python process: `python routing/laya_router.py --http`.
- * This keeps the plugin free of Python dependencies -- it just POSTs JSON.
+ * The judge is a remote decision call to the TokenRhythm System One endpoint with the
+ * NeoHorse-Jev-4B model, not a local process. Every failure path returns null and the caller
+ * falls back to the route table's fallback column.
+ */
+export function systemOneDifficultyRequest(cfg, taskText) {
+  return {
+    model: cfg.model || DEFAULT_JUDGE_MODEL,
+    state: { task: taskText.slice(0, JUDGE_MAX_CHARS) },
+    questions: {
+      difficulty: {
+        type: 'choice',
+        instructions: 'Rate the difficulty of this task. Answer with exactly one option id.',
+        criteria: {
+          easy: 'trivial, simple, or routine; little reasoning needed',
+          medium: 'moderate complexity; careful work needed',
+          hard: 'complex, long, or high-stakes; deep reasoning needed',
+        },
+      },
+    },
+  };
+}
+
+/** Parse the System One difficulty answer (v1), or null for every failure. */
+export function parseSystemOneDifficultyAnswer(raw) {
+  if (raw === null || typeof raw !== 'object') return null;
+  const answers = raw.answers;
+  if (answers === null || typeof answers !== 'object') return null;
+  const choice = answers.difficulty === null || typeof answers.difficulty !== 'object'
+    ? null : answers.difficulty.choice;
+  return choice === 'easy' || choice === 'medium' || choice === 'hard' ? choice : null;
+}
+
+/**
+ * Ask the System One judge (HTTP) for one difficulty level (v1 / `judge` mode).
+ *
  * Every failure path returns null and the caller falls back.
  */
-export async function judgeDifficulty(ctx, taskText, sessionId, signal) {
+export async function judgeDifficulty(ctx, cfg, taskText, sessionId, signal) {
   if (taskText === null || taskText === '') return null;
-  const url = process.env.LAYA_ROUTER_URL || 'http://127.0.0.1:8765/judge';
-  const timeout = AbortSignal.timeout(JUDGE_TIMEOUT_MS);
+  const key = await resolveCredential(ctx, cfg);
+  if (key === null) return null;
+  const timeout = AbortSignal.timeout(cfg.timeoutMs || JUDGE_TIMEOUT_MS);
   if (signal !== undefined && typeof signal.addEventListener === 'function') {
     signal.addEventListener('abort', () => timeout.abort?.(), { once: true });
   }
   try {
-    const res = await fetch(url, {
+    const res = await fetch(cfg.baseUrl || DEFAULT_JUDGE_BASE_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task: taskText.slice(0, JUDGE_MAX_CHARS) }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify(systemOneDifficultyRequest(cfg, taskText)),
       signal: timeout,
     });
     if (!res.ok) {
-      log(`Laya router HTTP ${res.status}`);
+      log(`judge HTTP ${res.status}`);
       return null;
     }
-    const j = await res.json();
-    if (j.error) {
-      log(`Laya router error: ${j.error}`);
-      return null;
-    }
-    // Map Laya's difficulty_level (0-3: trivial/easy/moderate/hard) -> LEVELS (easy/medium/hard)
-    const label = j.difficulty_label || '';
-    if (label === 'trivial' || label === 'easy') return 'easy';
-    if (label === 'moderate') return 'medium';
-    if (label === 'hard') return 'hard';
-    log(`Laya returned unknown level: ${label}`);
-    return null;
+    const level = parseSystemOneDifficultyAnswer(await res.json());
+    if (level === null) log(`judge returned no usable difficulty`);
+    return level;
   } catch (e) {
-    log(`Laya router call failed: ${e.message}`);
+    log(`judge call failed: ${e.message}`);
     return null;
   }
 }
 
 /**
- * Ask the Laya router (HTTP) for one tier (AUTO mode, plugin v2).
+ * Build the System One tier-judgment request (AUTO mode, plugin v2).
  *
- * Wire format (v2 defines it; v1's judgeDifficulty sends `{task}` only): the current task text
- * plus the session's previous tier and task text, so the Python side runs the full product path
- * -- dictionary intent, 7-question judge, rule engine with rule 0, regenerate detection, and the
- * constraint algebra as the last gate. Every failure path returns null and the caller applies
- * TIER_TABLE.fallback (deepseek review F2: "never break the session" means the fallback ROUTE
- * here; a route the profile cannot serve is handled separately by `usableRoute`).
+ * Pure, so tests drive the wire contract without a network. The current task text plus the
+ * session's previous tier and task text go into `state`; two choice questions ask for the tier
+ * and the reason, and the model's instructions carry the product policy (explicit intent wins,
+ * retry escalates, exclusions cap, otherwise content difficulty).
  */
-export async function judgeTier(taskText, prevTier, prevTask, sessionId, signal) {
+export function systemOneTierRequest(cfg, taskText, prevTier, prevTask, sessionId) {
+  return {
+    model: cfg.model || DEFAULT_JUDGE_MODEL,
+    state: {
+      task: taskText.slice(0, JUDGE_MAX_CHARS),
+      prev_tier: prevTier === undefined ? null : prevTier,
+      prev_task: prevTask === undefined ? null : prevTask,
+      session_id: sessionId === undefined ? null : sessionId,
+    },
+    questions: {
+      tier: {
+        type: 'choice',
+        instructions: 'Classify how much reasoning this task needs. Policy: an explicit user tier '
+          + 'demand wins; a task that repeats the previous task text (a retry) escalates one level; '
+          + 'a stated exclusion caps the tier; otherwise judge content difficulty. '
+          + 'Answer with exactly one option id.',
+        criteria: {
+          low: 'simple, chatty, or routine task; little reasoning needed',
+          high: 'moderate complexity; careful work and verification needed',
+          max: 'hard task, a retry that already failed, or the user explicitly demands the highest tier',
+        },
+      },
+      reason: {
+        type: 'choice',
+        instructions: 'Why this tier? Answer with exactly one option id.',
+        criteria: {
+          content: 'content-based difficulty',
+          intent_force: 'the user explicitly demands the highest tier',
+          intent_inherit: 'the user says continue; keep the previous tier',
+          intent_exclude: 'the user excluded a tier',
+          escalate_regenerate: 'the task text repeats the previous task (retry); escalate',
+        },
+      },
+    },
+  };
+}
+
+/** Parse the System One tier answer into `{tier, triggered_by}`, or null for every failure. */
+export function parseSystemOneTierAnswer(raw) {
+  if (raw === null || typeof raw !== 'object') return null;
+  const answers = raw.answers;
+  if (answers === null || typeof answers !== 'object') return null;
+  const tier = answers.tier === null || typeof answers.tier !== 'object' ? null : answers.tier.choice;
+  if (typeof tier !== 'string' || !TIER_OPTIONS.includes(tier)) return null;
+  const reason = answers.reason === null || typeof answers.reason !== 'object' ? null : answers.reason.choice;
+  const triggeredBy = typeof reason === 'string' && REASON_OPTIONS.includes(reason) ? reason : 'content';
+  return { tier, triggered_by: triggeredBy, labels: null };
+}
+
+/**
+ * Resolve the judge API key through DSH's `credentials` service by reference.
+ *
+ * The plugin never reads the key itself -- the service returns it at runtime, and a missing or
+ * unset reference falls back to null so the caller keeps the low tier (fail-safe, never a break).
+ */
+async function resolveCredential(ctx, cfg) {
+  const credentials = ctx !== undefined && ctx !== null ? ctx.get('credentials') : undefined;
+  const ref = cfg.credentialRef || DEFAULT_CREDENTIAL_REF;
+  if (credentials === undefined || credentials === null || typeof credentials.resolve !== 'function') {
+    log(`credentials service unavailable; the judge needs credentialRef ${ref}`);
+    return null;
+  }
+  try {
+    const entry = await credentials.resolve(ref);
+    const value = entry !== undefined && entry !== null && typeof entry === 'object' ? entry.value : entry;
+    if (value === undefined || value === null || value === '') {
+      log(`credentialRef ${ref} is not set -- judge falls back to low`);
+      return null;
+    }
+    return String(value);
+  } catch (error) {
+    log(`credential resolve failed: ${error && error.message ? error.message : error}`);
+    return null;
+  }
+}
+
+/**
+ * Ask the System One judge (HTTP) for one tier (AUTO mode, plugin v2).
+ *
+ * The request carries the current task text plus the session's previous tier and task text so the
+ * model applies the full product policy; the response supplies `{tier, triggered_by}`. Every failure
+ * path returns null and the caller applies TIER_TABLE.fallback (deepseek review F2: "never break the
+ * session" means the fallback ROUTE here; a route the profile cannot serve is handled separately by
+ * `usableRoute`).
+ */
+export async function judgeTier(ctx, cfg, taskText, prevTier, prevTask, sessionId, signal) {
   if (taskText === null || taskText === '') return null;
-  const url = process.env.LAYA_ROUTER_URL || 'http://127.0.0.1:8765/judge';
-  const timeout = AbortSignal.timeout(JUDGE_TIMEOUT_MS);
+  const key = await resolveCredential(ctx, cfg);
+  if (key === null) return null;
+  const timeout = AbortSignal.timeout(cfg.timeoutMs || JUDGE_TIMEOUT_MS);
   if (signal !== undefined && typeof signal.addEventListener === 'function') {
     signal.addEventListener('abort', () => timeout.abort?.(), { once: true });
   }
   try {
-    const res = await fetch(url, {
+    const res = await fetch(cfg.baseUrl || DEFAULT_JUDGE_BASE_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        task: taskText.slice(0, JUDGE_MAX_CHARS),
-        prev_tier: prevTier === undefined ? null : prevTier,
-        prev_task: prevTask === undefined ? null : prevTask,
-        session_id: sessionId === undefined ? null : sessionId,
-      }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify(systemOneTierRequest(cfg, taskText, prevTier, prevTask, sessionId)),
       signal: timeout,
     });
     if (!res.ok) {
-      log(`Laya router HTTP ${res.status}`);
+      log(`judge HTTP ${res.status}`);
       return null;
     }
-    const j = await res.json();
-    if (j.error) {
-      log(`Laya router error: ${j.error}`);
-      return null;
-    }
-    if (typeof j.tier !== 'string' || j.tier === '') {
-      log(`Laya router returned no tier`);
-      return null;
-    }
-    return { tier: j.tier, triggered_by: j.triggered_by || '', labels: j.labels || null };
+    const parsed = parseSystemOneTierAnswer(await res.json());
+    if (parsed === null) log(`judge returned no usable tier`);
+    return parsed;
   } catch (e) {
-    log(`Laya router call failed: ${e.message}`);
+    log(`judge call failed: ${e.message}`);
     return null;
   }
 }
@@ -639,147 +718,14 @@ export function nextSessionState(state, turn, taskText, judgment) {
 }
 
 /**
- * The judge service's base URL -- the one place `LAYA_ROUTER_URL` is read for the health probe.
+ * Bring the judge up, then wait for it to answer. Never throws.
  *
- * `LAYA_ROUTER_URL` is the full endpoint (`.../judge`); `/health` is its sibling, so the tail is
- * replaced rather than appended to whatever the user configured.
+ * The judge is remote (TokenRhythm System One): mounting the row IS starting it, so this returns
+ * the ready message immediately. Returns a short human-readable outcome for the log; the caller
+ * ignores it.
  */
-export function serviceBaseUrl(env = process.env) {
-  const raw = env.LAYA_ROUTER_URL || 'http://127.0.0.1:8765/judge';
-  return String(raw).replace(/\/judge\/?$/, '');
-}
-
-/**
- * What a spawn of the judge service needs, or null when this install cannot launch one.
- *
- * Pure, so the tests drive it without touching a filesystem: `exists` and `platform` are injected.
- * Explicit config always wins; the dev-checkout walk is only a convenience for running out of this
- * repository, where the venv and the checkpoint live in known places.
- */
-export function serviceLaunchSpec(cfg, env, here, exists, platform) {
-  if (cfg.autoStart === false) return null;
-  const script = cfg.serviceScript || (env.LAYA_MODEL_SCRIPT);
-  const python = cfg.servicePython;
-  if (script !== undefined && python !== undefined) {
-    return exists(script) && exists(python) ? { python, script } : null;
-  }
-  // Dev checkout: this file sits at <repo>/routing/plugin/dsh-router-laya/index.js. The checkpoint
-  // under <repo>/training is the marker -- a packaged install does not ship it here.
-  let dir = here;
-  for (let depth = 0; depth < 6 && dir !== undefined; depth++) {
-    const repo = dir;
-    if (exists(`${repo}/training/laya_router_finetuned`)) {
-      const venv = platform === 'win32' ? '/.venv/Scripts/python.exe' : '/.venv/bin/python';
-      if (exists(repo + venv) && exists(`${repo}/routing/laya_router.py`)) {
-        return { python: repo + venv, script: `${repo}/routing/laya_router.py` };
-      }
-      break;
-    }
-    const up = repo.replace(/[\\/][^\\/]+$/, '');
-    dir = up === repo || up === '' ? undefined : up;
-  }
-  return null;
-}
-
-/** Resolve a URL without `URL.parse` throwing on a value a user typed. */
-function resolveUrl(value) {
-  const parsed = new URL(value);
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error(`unsupported protocol ${parsed.protocol}`);
-  }
-  return parsed;
-}
-
-/** Request one URL and return the parsed JSON body, or null for every failure and non-2xx. */
-async function getJson(url, timeoutMs) {
-  let parsed;
-  try {
-    parsed = resolveUrl(url);
-  } catch {
-    return null;
-  }
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(parsed, { method: 'GET', signal: controller.signal });
-    return res.ok ? await res.json() : null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Whether the judge is up *and* speaking the protocol this plugin's AUTO path needs.
- *
- * `protocol=finetuned` is the acceptance the handoff's step 5 uses (`GET /health`), and it is the
- * difference between tier output and the base protocol's difficulty labels: a base-protocol service
- * answers `/judge` with no `tier` field at all, which auto mode would silently treat as unreachable.
- * So a healthy base service is correctly reported as NOT usable here rather than started twice.
- */
-export async function judgeServiceUp(base, timeoutMs = SERVICE_HEALTH_TIMEOUT_MS) {
-  const info = await getJson(`${base}/health`, timeoutMs);
-  return info !== null && info.protocol === 'finetuned';
-}
-
-/**
- * Bring the judge up if it is down, then wait for it to answer. Never throws.
- *
- * Returns a short human-readable outcome for the log; the caller ignores it. Called asynchronously
- * from `apply()` so DSH's boot is never waiting on an 807 MB checkpoint load.
- */
-export async function ensureJudgeService(cfg, env = process.env) {
-  const base = serviceBaseUrl(env);
-  if (await judgeServiceUp(base)) return `already up (${base})`;
-
-  let spec;
-  try {
-    spec = serviceLaunchSpec(cfg, env, hereDir, fsExists, process.platform);
-  } catch (e) {
-    return `could not resolve a service to launch: ${e.message}`;
-  }
-  if (spec === null) {
-    return `down and no service found to launch -- set config.servicePython/serviceScript `
-      + `to enable auto-start (see README)`;
-  }
-
-  let logFd;
-  try {
-    logFd = openSync(SERVICE_LOG_PATH, 'a');
-  } catch {
-    logFd = undefined; // an unwritable temp dir must not stop the start attempt
-  }
-  try {
-    // Prefer pythonw.exe on Windows: python.exe is console-subsystem and will attach/create a
-    // console even when Node asks for windowsHide. pythonw is windowed -- no black box at all.
-    let python = spec.python;
-    if (process.platform === 'win32') {
-      const pythonw = python.replace(/python(\.exe)?$/i, 'pythonw.exe');
-      if (pythonw !== python && fsExists(pythonw)) python = pythonw;
-    }
-    const child = spawn(python, [spec.script, '--http', '--port', String(new URL(base).port || 80)], {
-      detached: true,
-      // Windows: detached wants a new console; without hide the empty black window sits forever.
-      windowsHide: true,
-      stdio: ['ignore', 'ignore', logFd === undefined ? 'ignore' : logFd],
-      env: { ...env, PYTHONIOENCODING: 'utf-8' },
-    });
-    child.unref();
-  } catch (e) {
-    return `spawn failed: ${e.message}`;
-  } finally {
-    // The child holds its own duplicate; the parent must not pin the file descriptor.
-    if (logFd !== undefined) { try { closeSync(logFd); } catch { /* already gone */ } }
-  }
-
-  const deadline = Date.now() + SERVICE_START_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => { setTimeout(resolve, 500); });
-    if (await judgeServiceUp(base)) return `started (${spec.python})`;
-  }
-  return `spawned but ${base}/health never answered in ${SERVICE_START_TIMEOUT_MS / 1000}s`
-    + ` -- see ${SERVICE_LOG_PATH}`;
+export async function ensureJudgeService(cfg) {
+  return `remote judge ready (${cfg.model || DEFAULT_JUDGE_MODEL} @ ${cfg.baseUrl || DEFAULT_JUDGE_BASE_URL}); no local service needed`;
 }
 
 export function apply(ctx, config) {
@@ -835,9 +781,11 @@ export function apply(ctx, config) {
     // The chip's side of the same switch: a same-origin route, because a static client bundle has no
     // `host.call` and no `ctx.remote.settings`.
     installModeRoute(ctx, modeSink);
+    installStateRoute(ctx, judgeState);
   } else if (judging) {
     log(`judging every turn; table easy=${routeLabel(table.easy)} `
       + `hard=${routeLabel(table.hard)} fallback=${routeLabel(table.fallback)}`);
+    installStateRoute(ctx, judgeState);
   } else {
     log(constant
       ? `forcing every request to ${routeLabel(schedule[0])}`
@@ -857,6 +805,18 @@ export function apply(ctx, config) {
    * the tier we served and the task text we served it for, feeding the next turn's
    * prev_tier/prev_task (regenerate detection + C3 escalation). */
   const sessionState = new Map();
+  /** In-memory judgment history served to the tier chip (the remote judge keeps no local service). */
+  const judgeLog = [];
+  let lastJudgmentOk = true;
+  const judgeState = {
+    read() {
+      const sessions = {};
+      for (const row of judgeLog) {
+        (sessions[row.sessionId] ||= []).push(row);
+      }
+      return { sessions, available: lastJudgmentOk };
+    },
+  };
   const keyOf = (payload) => {
     const session = payload && payload.agent && payload.agent.session;
     return (session && (session.id || session.sessionId)) || 'global';
@@ -921,7 +881,7 @@ export function apply(ctx, config) {
         : undefined;
       const judgment = task === undefined
         ? null
-        : await judgeTier(task.text, state ? state.tier : undefined, state ? state.task : undefined,
+        : await judgeTier(ctx, cfg, task.text, state ? state.tier : undefined, state ? state.task : undefined,
           task.sessionId, payload && payload.signal);
       // Fail-safe, two branches (plan §4.4): /judge unreachable -> the fallback ROUTE (low);
       // a route this profile cannot serve -> leave the request on its own config (usableRoute
@@ -939,6 +899,15 @@ export function apply(ctx, config) {
       if (task !== undefined) {
         sessionState.set(key, { tier: servedTier, task: task.text, turn });
       }
+      judgeLog.push({
+        ts: Math.floor(Date.now() / 1000),
+        sessionId: key,
+        tier: servedTier,
+        triggered_by: judgment === null ? '' : judgment.triggered_by,
+        task: (task === undefined ? '' : task.text).slice(0, 30),
+      });
+      if (judgeLog.length > 200) judgeLog.splice(0, judgeLog.length - 200);
+      lastJudgmentOk = judgment !== null;
       log(`turn ${turn} auto "${task === undefined ? '(no task text captured)' : task.text.slice(0, 60).replace(/\s+/g, ' ')}"`
         + ` -> ${judgment === null ? 'judge unreachable -> fallback' : `${judgment.tier} (${judgment.triggered_by})`} -> `
         + (route === null ? 'left on its own config' : routeLabel(route)));
@@ -956,9 +925,19 @@ export function apply(ctx, config) {
       const task = tasks.get(key);
       const level = task === undefined
         ? null
-        : await judgeDifficulty(ctx, task.text, task.sessionId, payload && payload.signal);
+        : await judgeDifficulty(ctx, cfg, task.text, task.sessionId, payload && payload.signal);
       const route = usableRoute(ctx, routeForLevel(level, table));
       verdicts.set(key, { turn, route });
+      const levelTier = level === 'hard' ? 'max' : level === 'medium' ? 'high' : 'low';
+      judgeLog.push({
+        ts: Math.floor(Date.now() / 1000),
+        sessionId: key,
+        tier: levelTier,
+        triggered_by: level === null ? '' : 'content',
+        task: (task === undefined ? '' : task.text).slice(0, 30),
+      });
+      if (judgeLog.length > 200) judgeLog.splice(0, judgeLog.length - 200);
+      lastJudgmentOk = level !== null;
       log(`turn ${turn} judged "${task === undefined ? '(no task text captured)' : task.text.slice(0, 60).replace(/\s+/g, ' ')}"`
         + ` -> ${level === null ? 'unjudged' : level} -> `
         + (route === null ? 'left on its own config' : routeLabel(route)));
@@ -968,7 +947,7 @@ export function apply(ctx, config) {
     counts.set(key, index + 1);
     const route = schedule[index % schedule.length];
     if (!constant) {
-      process.stderr.write(`[router-laya] request #${index} (turn ${payload && payload.turn}, step `
+      process.stderr.write(`[router-neohorse] request #${index} (turn ${payload && payload.turn}, step `
         + `${payload && payload.step}) -> ${routeLabel(route)}\n`);
     }
     return applyRoute(config, route);

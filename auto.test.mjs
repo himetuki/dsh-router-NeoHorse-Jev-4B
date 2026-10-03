@@ -2,9 +2,9 @@
 // state machine -- everything that decides where a request lands, without needing DSH or the
 // Python service. Plain-script check, repo convention (see parseArm.test.mjs).
 //
-//     node routing/plugin/dsh-router-laya/auto.test.mjs
+//     node auto.test.mjs
 import { Config, isOurRoute, MODE_NS, nextSessionState, resolveModeEntryId, resolveSchedule,
-  serviceBaseUrl, serviceLaunchSpec, TIER_TABLE } from './index.js';
+  TIER_TABLE } from './index.js';
 import { isVolatile } from '@deepseek-ai/cosmokit';
 
 let pass = 0;
@@ -45,7 +45,7 @@ withArm('AUTO', (r) => check('resolve AUTO case-insensitive', r, 'auto'));
 
 // Session state machine (nextSessionState):
 // turn 1: no previous state, judgment present -> state advances to the judged tier/task.
-let s = nextSessionState(undefined, 1, '帮我优化一下', { tier: 'low', triggered_by: 'laya' });
+let s = nextSessionState(undefined, 1, '帮我优化一下', { tier: 'low', triggered_by: 'neohorse' });
 check('t1 fresh', s, { tier: 'low', task: '帮我优化一下', turn: 1 });
 
 // turn 2: regenerate detected on the Python side (tier high) -> state advances to high.
@@ -57,7 +57,7 @@ s = nextSessionState(s, 3, '还是不行，再试一次', { tier: 'max', trigger
 check('t3 caps at max', s, { tier: 'max', task: '还是不行，再试一次', turn: 3 });
 
 // new unrelated task: normal judgment replaces the state (no tier inheritance outside intent).
-s = nextSessionState(s, 4, 'write a poem', { tier: 'low', triggered_by: 'laya' });
+s = nextSessionState(s, 4, 'write a poem', { tier: 'low', triggered_by: 'neohorse' });
 check('t4 new task resets tier by judgment', s, { tier: 'low', task: 'write a poem', turn: 4 });
 
 // judgment FAILED (judge unreachable): keep the last known tier but advance task/turn -- the
@@ -68,7 +68,7 @@ check('t5 failed judgment keeps tier, advances task/turn',
 
 // turn went BACKWARDS (session reset / id reuse): stale prev_tier/prev_task must not leak
 // into the fresh conversation (deepseek F4) -- the state is discarded and rebuilt from turn 1.
-s = nextSessionState(s, 1, 'brand new conversation', { tier: 'low', triggered_by: 'laya' });
+s = nextSessionState(s, 1, 'brand new conversation', { tier: 'low', triggered_by: 'neohorse' });
 check('t-backwards resets state', s, { tier: 'low', task: 'brand new conversation', turn: 1 });
 
 // judgment failed on a fresh conversation: tier falls back to low (the C3 default), state rebuilt.
@@ -91,58 +91,22 @@ check('ours: unknown tier in state',
 check('ours: model mismatch (delegation to another model)',
   isOurRoute({ reasoningEffort: 'low', model: 'qwen3.8-flash' }, served), false);
 
-// Service discovery for auto-start (distribution): pure, so `exists`/`platform` are injected and no
-// filesystem is touched. The point of these cases is that a WRONG guess is worse than no guess --
-// spawning a missing python would log a lie, so every unresolved shape must return null.
-const has = (...paths) => (p) => paths.includes(p);
-const REPO = '/repo';
-const HERE = '/repo/routing/plugin/dsh-router-laya';
-
-check('service url: strips /judge',
-  serviceBaseUrl({ LAYA_ROUTER_URL: 'http://127.0.0.1:9999/judge' }), 'http://127.0.0.1:9999');
-check('service url: trailing slash', serviceBaseUrl({ LAYA_ROUTER_URL: 'http://127.0.0.1:9999/judge/' }),
-  'http://127.0.0.1:9999');
-check('service url: default', serviceBaseUrl({}), 'http://127.0.0.1:8765');
-
-check('autoStart:false disables discovery', serviceLaunchSpec({ autoStart: false }, {}, HERE, has(), 'linux'), null);
-check('dev checkout resolves the venv by platform (win32)',
-  serviceLaunchSpec({}, {}, HERE,
-    has('/repo/training/laya_router_finetuned', '/repo/.venv/Scripts/python.exe', '/repo/routing/laya_router.py'),
-    'win32'),
-  { python: '/repo/.venv/Scripts/python.exe', script: '/repo/routing/laya_router.py' });
-check('dev checkout resolves the venv by platform (posix)',
-  serviceLaunchSpec({}, {}, HERE,
-    has('/repo/training/laya_router_finetuned', '/repo/.venv/bin/python', '/repo/routing/laya_router.py'),
-    'linux'),
-  { python: '/repo/.venv/bin/python', script: '/repo/routing/laya_router.py' });
-check('no checkpoint marker -> no guess',
-  serviceLaunchSpec({}, {}, '/usr/lib/node_modules/dsh-router-laya', has(), 'linux'), null);
-check('explicit config wins',
-  serviceLaunchSpec({ servicePython: '/py', serviceScript: '/pkg/service/laya_router.py' }, {}, '/nowhere',
-    has('/py', '/pkg/service/laya_router.py'), 'linux'),
-  { python: '/py', script: '/pkg/service/laya_router.py' });
-check('explicit config pointing at nothing -> null, never a spawn',
-  serviceLaunchSpec({ servicePython: '/missing', serviceScript: '/missing.py' }, {}, '/nowhere', has(), 'linux'),
-  null);
-check('venv absent in a checkout -> null rather than bare python',
-  serviceLaunchSpec({}, {}, HERE, has('/repo/training/laya_router_finetuned'), 'linux'), null);
-
 // ── mode entry id + volatile Config (write-path prerequisites) ────────────────────────────────
 check('entry id: bundle insert',
-  resolveModeEntryId([{ options: { id: 'include:router-laya', name: 'dsh-router-laya' } }]),
-  'include:router-laya');
+  resolveModeEntryId([{ options: { id: 'include:router-neohorse', name: 'dsh-router-neohorse' } }]),
+  'include:router-neohorse');
 check('entry id: hand-patched row',
-  resolveModeEntryId([{ options: { id: 'router-laya', name: 'dsh-router-laya' } }]),
-  'router-laya');
+  resolveModeEntryId([{ options: { id: 'router-neohorse', name: 'dsh-router-neohorse' } }]),
+  'router-neohorse');
 check('entry id: empty -> fallback',
   resolveModeEntryId([], MODE_NS), MODE_NS);
 check('entry id: other plugin ignored',
   resolveModeEntryId([
     { options: { id: 'include:other', name: 'dsh-other' } },
-    { options: { id: 'include:router-laya', name: 'dsh-router-laya' } },
-  ]), 'include:router-laya');
+    { options: { id: 'include:router-neohorse', name: 'dsh-router-neohorse' } },
+  ]), 'include:router-neohorse');
 check('entry id: null entry ignored',
-  resolveModeEntryId([null, undefined, { options: { name: 'dsh-router-laya' } }], 'fb'), 'fb');
+  resolveModeEntryId([null, undefined, { options: { name: 'dsh-router-neohorse' } }], 'fb'), 'fb');
 
 // `mode` must stay volatile or settings.update refuses a non-volatile path (and the chip 503s).
 // cosmokit's isVolatile tests resolved *references*, so assert both the schema meta and the ref
@@ -151,12 +115,12 @@ check('Config.mode schema meta is volatile', Config.dict.mode.meta.volatile === 
 check('Config.mode resolves to a volatile ref', isVolatile(Config({}).mode), true);
 check('Config.auto is not volatile', Config.dict.auto.meta.volatile === undefined, true);
 check('Config keeps ordinary row fields',
-  ['auto', 'judge', 'routes', 'tiers', 'global', 'servicePython', 'serviceScript', 'autoStart']
+  ['auto', 'judge', 'routes', 'tiers', 'global', 'baseUrl', 'model', 'credentialRef', 'timeoutMs']
     .every((key) => Object.hasOwn(Config.dict, key)), true);
 
 // ── report ───────────────────────────────────────────────────────────────────────────────────
 console.log('='.repeat(70));
-console.log(`  router-laya AUTO checks: ${pass} passed, ${fail.length} failed`);
+console.log(`  router-neohorse AUTO checks: ${pass} passed, ${fail.length} failed`);
 console.log('='.repeat(70));
 for (const line of fail) console.log('  FAIL ' + line);
 process.exit(fail.length ? 1 : 0);

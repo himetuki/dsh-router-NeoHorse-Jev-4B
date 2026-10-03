@@ -12,20 +12,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: install plugin test peers (schemastery + cosmokit)
         run: npm install --no-audit --no-fund
-      - name: plugin tests (arm parsing + auto state machine)
+      - name: plugin tests (arm parsing, auto state machine, System One wire, judge contract)
         run: |
           node parseArm.test.mjs
           node auto.test.mjs
-      - name: fetch.mjs dry-run (release-first source chain)
-        run: node weights/fetch.mjs --dry-run
-      - name: python syntax (vendored service)
-        run: python -m compileall -q service
-      - name: charts reproducible
-        run: |
-          python scripts/make_charts.py
-          git diff --exit-code docs/charts || (echo "charts are stale -- run scripts/make_charts.py" && exit 1)
+          node neohorse.test.mjs
+          node contract.test.mjs

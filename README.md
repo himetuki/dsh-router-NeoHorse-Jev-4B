@@ -1,109 +1,84 @@
-# dsh-router-laya
+# dsh-router-neohorse
 
 一个 DSH 插件：对没有明确档位指令的消息，自动选择思考档（low / high / max）。
 
-做法是在本地跑一个微调过的分类模型（842MB，CPU 推理不到 1 秒），配合会话内的检测无感自动升降档。
-全程本地离线，超快响应，适配日常使用，从此让Harness开启"自动驾驶"模式。
+判定交给**基元律动（TokenRhythm）的 `NeoHorse-Jev-4B` 决策模型**——通过其 System One 兼容接口
+（`https://tokenrhythm.studio/v1/systemone`）按需调用，配合会话内的检测自动升降档。
 
-## 为什么做它——以及为什么值得你试试
+> 本仓库改编自 [HapyRain/dsh-router-laya](https://github.com/HapyRain/dsh-router-laya)（Apache-2.0）：
+> 判定端改为基元律动 NeoHorse-Jev-4B 的远程 System One 调用，其余路由逻辑保持不变。
 
-你大概也有同感：想让 AI 在难题上多想一会儿，就得手动把档位拉满；而大多数日常消息，
-拉满纯属浪费——多烧的 token 换不来更好的回答，来回手动切又麻烦，时间,tokens双双爆炸💥！
+## 它做什么
 
-关于本插件逻辑的一些理论支持：
+- **省钱**：简单消息走 `low`，不为简单问题支付高推理成本
+- **快**：低档首字响应更快；判定是一次轻量调用
+- **难事不掉链子**：任务复杂、或你在重试时自动升档，`max` 兜底
+- **判断一次**：每轮只对第一条任务消息判定一次档位，同轮内的多步模型调用共用该档位
+- **失败安全**：判定服务不可达、凭据缺失或超时 → 落 `low`，会话不断
 
-- **DeepSeek 的 V3.2 技术报告专门写了这个机制**（thinking budget）：模型训练时就按
-  「在给定的思考 token 预算内最大化准确率」来优化，报告里附了不同预算下的性能曲线。
-  所谓档位，对应的其实就是这份预算——档位高，能思考的 token 多，消耗也大。
-- **OpenAI 的 o3-mini 直接按 low/medium/high 三档发布官方成绩**：低档在多数任务上已经够用，
-  高档只在高难任务上拉开差距（[官方公告](https://openai.com/index/o3-mini/)）。
-- **《Thoughtology》综述对 R1 系模型的测量**：强模型的准确率随思考预算增长很快饱和，
-  大多数任务用不满大预算，多出来的基本是白烧。
-- Qwen3 的按请求预算、Anthropic 的 budget_tokens、LangChain 的 reasoning_effort——
-  「档位 ≈ 思考 token 预算帽」已经是行业通行的实现。
+档位由两个 choice 问题一次问出：
 
-档位是真实存在的旋钮，问题只剩一个：**谁来判断该拧到几档？** 手动切麻烦，全局拉满浪费。
-dsh-router-laya 把这个判断交给一个本地小模型：
-它先看一眼你的消息，决定需要多少思考，再把请求路由到合适的档位——你只管发消息。
-具体来说：
+- `tier`（low / high / max）：本任务需要多少思考
+- `reason`（content / intent_force / intent_inherit / intent_exclude / escalate_regenerate）：为什么是这个档位
 
-- **省钱**：简单消息走 low，思考 token 只有拉满时的零头，不再为简单问题支付推理成本
-- **快**：低档首字响应更快；本地判定不到 1 秒，无感
-- **难事不掉链子**：任务复杂或你在重试时自动升档，max 兜底
-- **隐私**：判定模型本地跑，任务文本不出本机
-- **越用越准**：判定模型可以随你的使用习惯持续重训
-
-另外我做了 120 多次本地对照实验交叉验证，方向与公开结论一致：单任务 low 档约 96% 成功
-（确实不必多花钱）；15 个任务连吃 low 档 42% 翻车、升档后约 17%——这就是这个插件要吃的
-那一段：
-
-![会话失败率 vs 任务数](docs/charts/chart-why.svg)
-
-负责判断的 7 题微调分类头，对金标（三模型交叉标注）一致率 99%、本地判定小于 1 秒：
-
-![判定质量](docs/charts/chart-accuracy.svg)
-
-会话内自动升档的实测阶梯——重试两轮，low 到 max：
-
-![升档实测](docs/charts/chart-ladder.svg)
-
-输入栏有个档位芯片，实时显示当前档位和最近 20 轮的判断原因；服务离线时变灰并给出启动命令。
+模型指令内嵌产品策略：显式档位指令优先、任务文本与上一轮相同（重试）升档、用户排除项封顶，
+否则按内容难度判定。
 
 ## 安装
 
-```bash
-npm i -g dsh-router-laya
-npx dsh-router-laya setup
+通过 DSH 的 GitHub 安装入口直接安装（无需 Python、无需下载权重、无需本地服务）：
+
+```text
+https://github.com/himetuki/dsh-router-NeoHorse-Jev-4B
 ```
 
-setup 做三件事：建 Python 虚拟环境、下载 846MB 的 checkpoint（走本仓 GitHub Release，
-HF 和镜像做兜底，支持断点续传）、启动判定服务。然后按它打印的 snippet 在你的 DSH profile
-里注册插件行，设两个环境变量：
+在 DSH Desktop：**侧边栏「插件」→「添加插件」** → 粘贴仓库地址 → **「安装」** → **「立即启用」**
+（若提示下次启动加载，重启 DSH Desktop）。
 
-```
-ROUTEEXP_ARM=auto
-ROUTEEXP_RESPECT_EXPLICIT=1
-```
+## 配置
 
-要求：Node ≥ 18，Python ≥ 3.10，约 2GB 磁盘。判定服务需要常驻（setup 会启动，重启机器后
-重跑 `npx dsh-router-laya setup` 或 service 里的启动脚本）。
+插件行的配置（默认值已写在 `cordis.patch.yml`）：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `auto` | `true` | 开启自动档位路由（`false` 时需手动） |
+| `baseUrl` | `https://tokenrhythm.studio/v1/systemone` | 基元律动 System One 兼容地址 |
+| `model` | `NeoHorse-Jev-4B` | 判定模型 ID |
+| `credentialRef` | `JEV_API_KEY` | DSH 凭据引用，API Key 通过该引用解析 |
+| `timeoutMs` | `30000` | 每次判定超时 |
+
+API Key **不要写进仓库或源码**：在 DSH 的凭据界面按 `credentialRef` 保存，插件运行时通过
+`ctx.credentials` 按引用解析（它从不读取 Key 本身）。没有 Key 或 Key 为空时，判定失败并安全落 `low`。
+
+运行时可在输入栏的档位芯片上切换 **Auto / 手动**，无需重启。
 
 ## 它怎么决定档位
 
-按顺序过四层，任何一层命中就停：
+每轮流程（与 v2 产品路径一致）：
 
-1. 词典意图：「用最高档」→ 直接定档（一票否决）；「继续」→ 保持上轮；「别用 max」→ 记一个约束
-2. 微调模型：laya接管判定（副作用 / 跨模块 / 步骤依赖 / 深推理 / 代码 / 生成 / 会话复利）→ 规则引擎出档
-3. 升级：这轮消息是上一轮的重试 → 沿阶梯升一级
-4. 约束过滤：第 1 层记下的约束最后统一执行
+1. 捕获本轮第一条任务消息（`agent/inbox/claimed`）。
+2. 在 `agent/request` 上带会话上下文（`prev_tier` / `prev_task` / `session_id`）调用 NeoHorse-Jev-4B，
+   一次得到 `tier` 与 `reason`。
+3. 按档位表把请求路由到对应的主模型路线：`low` → deepseek-flash low；`high` → deepseek-flash high；
+   `max` → deepseek-flash max；判定失败 → `low`（`fallback`）。档位表可通过 `tiers` 配置重映射。
+4. 轮次结束后记录档位，作为下一轮的 `prev_tier` / `prev_task`（重试检测用）。
 
-失败路径：判定服务不可达 → 落 low，会话不断(概率极低<0.3%)。
+档位芯片（输入栏右侧）实时显示当前档位、切换 Auto/手动，并列出最近判断的档位、原因与任务片段。
 
-## 已知边界
+## 隐私与安全
 
-- 判定耗时 1–3 秒，计入每轮首字延迟
-- 服务需要常驻进程；DSH 大版本更新可能改动前端注入缝，client.js 需要跟着适配
-- 权重下载在国内网络走镜像兜底，首次 846MB
+- 发给判定服务的只有：任务文本（截断到 4000 字符）、上一轮档位与任务文本、会话 id。
+- 判定结果只用于选择主模型的档位；插件不改写任何模型请求体之外的参数，不增删工具，不改权限或沙箱。
+- API Key 经 DSH 凭据服务按引用解析，插件与仓库都不接触明文 Key。
 
-## 数据与复现
+## 与上游 `dsh-router-laya` 的关系
 
-README 里的图由 `scripts/make_charts.py`（纯 stdlib）从实测数据生成，CI 会检查图表是否过期。
-实验全记录（试筛、判读规则、标注方案、验收数据）在主开发仓
-[HapyRain/layaDemo](https://github.com/HapyRain/layaDemo) 的 docs/ 目录。(整理后转公开)
+两者是同一个插件的两个版本，**同一 profile 只能安装其中一个**：
 
-## 写在最后
-
-这个插件目前还在尝试阶段，有不少没做完的地方。当前实现的判断逻辑，针对日常使用是够用的；
-如果你要把它用在大项目、高难度任务，或者对识别率有更高要求，建议基于你自己的使用习惯重新
-微调一版模型——标注、训练、验收的整条链都是现成的（见上面的数据与复现），换一批你自己的
-语料就能重训，本机只要有独立的 GPU 的话几分钟一轮，相当快。
-
-我自己后面有精力的话，也会再用新语料把 Laya 重新微调一版。这次做得比较仓促，见谅。
-
-这本身只是一个小思路。哪里不对、哪里可以更好，欢迎在 GitHub Issues 里提，我都会看。
+- 本版包名与行 id 已改为 `dsh-router-neohorse` / `router-neohorse`，与上游不撞名；
+- 切换来源前先移除另一个插件。
 
 ## License
 
-本项目代码为 Apache-2.0。判定模型基于 [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya)
-与 [answerdotai/ModernBERT-large](https://huggingface.co/answerdotai/ModernBERT-large) 两个
-Apache-2.0 项目微调而来，按协议要求在 [NOTICE](./NOTICE) 中署名，在此向两个上游项目致谢。
+Apache-2.0。改编自 [HapyRain/dsh-router-laya](https://github.com/HapyRain/dsh-router-laya)
+（Apache-2.0）；致谢见 [NOTICE](./NOTICE)。

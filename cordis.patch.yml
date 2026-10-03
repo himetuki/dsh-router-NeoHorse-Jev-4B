@@ -1,9 +1,14 @@
 # dsh bundle patch: inserts this plugin's row into a profile's layer stack.
 #
-# NOTE for the current dev install: the web profile's own cordis.patch.yml already inserts a row with
-# this id (`router-laya`), because that is how the plugin was mounted before this package existed. Do NOT
-# list this package in `dsh.profile.bundles` while that hand-written row is still there -- Cordis refuses
-# a tree with a duplicate loader entry id, and the profile would not boot.
+# The judge is a remote TokenRhythm System One call (NeoHorse-Jev-4B); `auto: true` turns on
+# per-turn tier routing. The API key is resolved by reference (`credentialRef`) through DSH's
+# credentials service -- this plugin never reads the key itself.
 - insert:
-    - id: router-laya
-      name: 'dsh-router-laya'
+    - id: router-neohorse
+      name: 'dsh-router-neohorse'
+      config:
+        auto: true
+        baseUrl: https://tokenrhythm.studio/v1/systemone
+        model: NeoHorse-Jev-4B
+        credentialRef: JEV_API_KEY
+        timeoutMs: 30000
