@@ -65,6 +65,8 @@ export const ROUTE_TABLE = {
 const DEFAULT_JUDGE_BASE_URL = 'https://tokenrhythm.studio/v1/systemone';
 const DEFAULT_JUDGE_MODEL = 'NeoHorse-Jev-4B';
 const DEFAULT_CREDENTIAL_REF = 'JEV_API_KEY';
+/** This package's name: the profile row's `name`, and the client config-slot key. */
+const PACKAGE_NAME = 'dsh-router-neohorse';
 const JUDGE_TIMEOUT_MS = 30000;
 /** Task text is truncated before it reaches the judge. */
 const JUDGE_MAX_CHARS = 4000;
@@ -94,6 +96,29 @@ export const MODE_NS = 'router-neohorse';
 /** `auto` routes every turn; `manual` leaves every request exactly as its owner configured it. */
 export const MODES = ['manual', 'auto'];
 
+const TIER_KEYS = ['low', 'high', 'max', 'fallback'];
+
+/**
+ * One tier's route. Declared as a schema (not `z.any()`) so DSH's own row-config surface renders
+ * real fields; every field stays optional because the schema materialises absent tiers as `{}`.
+ */
+const TierRoute = z.object({
+  provider: z.string(),
+  model: z.string(),
+  effort: z.string(),
+});
+
+/**
+ * Tier table overrides. `low/high/max/fallback` each point at a provider + model (+ optional
+ * effort); anything a row leaves out keeps the built-in default (see `effectiveTiers`).
+ */
+const Tiers = z.object({
+  low: TierRoute,
+  high: TierRoute,
+  max: TierRoute,
+  fallback: TierRoute,
+});
+
 /**
  * Config schema. `mode` is volatile so `settings.update` can flip it without remounting the row
  * (same pattern as dsh-agent-default-model's provider/model). Everything else is the row's ordinary
@@ -104,7 +129,7 @@ export const Config = z.object({
   auto: z.boolean(),
   judge: z.boolean(),
   routes: z.any(),
-  tiers: z.any(),
+  tiers: Tiers,
   global: z.boolean(),
   baseUrl: z.string().default(DEFAULT_JUDGE_BASE_URL),
   model: z.string().default(DEFAULT_JUDGE_MODEL),
@@ -312,6 +337,57 @@ function installModeRoute(ctx, sink) {
 }
 
 /**
+ * Merge a row's tier overrides over the built-in table.
+ *
+ * A tier only replaces the default when it names BOTH a provider and a model: the Config schema
+ * materialises a missing tier as `{}`, and a partial entry would otherwise route a request to an
+ * undefined provider (which `usableRoute` then rejects, silently disabling routing for that tier).
+ * A blank `effort` means "no effort field" -- the target adapter's own default.
+ */
+export function effectiveTiers(cfg) {
+  const out = { ...TIER_TABLE };
+  const declared = cfg !== null && typeof cfg === 'object' ? cfg.tiers : undefined;
+  if (declared === null || typeof declared !== 'object') return out;
+  for (const key of TIER_KEYS) {
+    const tier = declared[key];
+    if (tier === null || typeof tier !== 'object') continue;
+    if (typeof tier.provider !== 'string' || tier.provider === '') continue;
+    if (typeof tier.model !== 'string' || tier.model === '') continue;
+    out[key] = typeof tier.effort === 'string' && tier.effort !== ''
+      ? { provider: tier.provider, model: tier.model, effort: tier.effort }
+      : { provider: tier.provider, model: tier.model };
+  }
+  return out;
+}
+
+/**
+ * Validate one submitted tier table, or return an error string.
+ *
+ * The configuration page posts the whole table, so an incomplete tier is a user mistake worth
+ * reporting instead of silently keeping a default the page already showed as filled in.
+ */
+export function normalizeTiersInput(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return { error: 'tiers must be an object' };
+  const out = {};
+  for (const key of Object.keys(value)) {
+    if (!TIER_KEYS.includes(key)) return { error: `unknown tier "${key}"` };
+  }
+  for (const key of TIER_KEYS) {
+    const tier = value[key];
+    if (tier === undefined) continue;
+    if (tier === null || typeof tier !== 'object') return { error: `tier "${key}" must be an object` };
+    const provider = typeof tier.provider === 'string' ? tier.provider.trim() : '';
+    const model = typeof tier.model === 'string' ? tier.model.trim() : '';
+    const effort = typeof tier.effort === 'string' ? tier.effort.trim() : '';
+    if (provider === '' || model === '') return { error: `tier "${key}" needs both provider and model` };
+    out[key] = effort === ''
+      ? { provider, model, effort: '' }
+      : { provider, model, effort };
+  }
+  return { tiers: out };
+}
+
+/**
  * Serve the tier chip's judgment log over the web carrier, same-origin.
  *
  * The remote judge keeps no local service, so the host half owns the in-memory history the chip
@@ -335,6 +411,176 @@ function installStateRoute(ctx, state) {
       },
     }));
   });
+}
+
+/**
+ * Serve the plugin's configuration page: the effective tier table, the provider/model/effort
+ * catalog behind it, and the write path back into the profile.
+ *
+ *   GET  /router-neohorse/config
+ *        -> `{ tiers, defaults, providers: [{id, name}], writable }`
+ *   GET  /router-neohorse/catalog?provider=<id>[&model=<id>]
+ *        -> `{ models: [{id, name}], efforts: [{id, name}], defaultEffort? }`
+ *   POST /router-neohorse/config   body `{ tiers: { low|high|max|fallback: {...} } }`
+ *        -> `{ tiers, saved: true }`
+ *
+ * The page is a static client bundle (no `host.call`), so same-origin routes are the one channel
+ * both halves share -- the same reason the mode switch and the state log live here. Writes go
+ * through the profile's own config editor, which validates them, persists the row into the profile
+ * patch and reconciles the Loader, so a save takes effect without a manual edit.
+ */
+export function installConfigRoute(ctx, cfg) {
+  ctx.inject(['webServer'], (scoped) => {
+    const webServer = scoped.get('webServer');
+    if (webServer === undefined || webServer === null) return;
+    const send = (res, code, body) => {
+      const text = JSON.stringify(body);
+      res.statusCode = code;
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      res.setHeader('Content-Length', String(Buffer.byteLength(text)));
+      res.end(text);
+    };
+    const fail = (res, error) => send(res, 500, { error: String(error && error.message ? error.message : error) });
+
+    scoped.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/router-neohorse/config',
+      handler: (req, res) => {
+        if (req.method === 'GET') {
+          Promise.resolve().then(() => send(res, 200, {
+            tiers: effectiveTiers(cfg),
+            defaults: TIER_TABLE,
+            providers: providerCatalog(ctx),
+            writable: configEntry(ctx) !== null,
+          })).catch((error) => fail(res, error));
+          return;
+        }
+        if (req.method !== 'POST') {
+          send(res, 405, { error: 'method not allowed' });
+          return;
+        }
+        let raw = '';
+        req.on('data', (chunk) => { raw += chunk; if (raw.length > 65536) req.destroy(); });
+        req.on('end', () => {
+          Promise.resolve().then(async () => {
+            let body;
+            try {
+              body = JSON.parse(raw);
+            } catch {
+              send(res, 400, { error: 'body must be json' });
+              return;
+            }
+            const submitted = body !== null && typeof body === 'object' ? body.tiers : undefined;
+            const checked = normalizeTiersInput(submitted);
+            if (checked.error !== undefined) {
+              send(res, 400, { error: checked.error });
+              return;
+            }
+            const entry = configEntry(ctx);
+            if (entry === null) {
+              send(res, 503, { error: 'no editable profile row for this plugin' });
+              return;
+            }
+            try {
+              await ctx.get('configEditor').edit(entry, (current) => ({
+                ...(current !== null && typeof current === 'object' ? current : {}),
+                tiers: checked.tiers,
+              }));
+            } catch (error) {
+              send(res, 503, { error: String(error && error.message ? error.message : error) });
+              return;
+            }
+            send(res, 200, { tiers: effectiveTiers({ ...cfg, tiers: checked.tiers }), saved: true });
+          }).catch((error) => fail(res, error));
+        });
+      },
+    }));
+
+    scoped.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/router-neohorse/catalog',
+      handler: (req, res) => {
+        if (req.method !== 'GET') {
+          send(res, 405, { error: 'method not allowed' });
+          return;
+        }
+        let query;
+        try {
+          query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+        } catch {
+          query = new URLSearchParams();
+        }
+        Promise.resolve()
+          .then(() => modelCatalog(ctx, query.get('provider') ?? '', query.get('model') ?? ''))
+          .then((catalog) => send(res, 200, catalog))
+          .catch((error) => fail(res, error));
+      },
+    }));
+  });
+}
+
+/** Every provider this profile can route to: registered adapter routes plus the configurable directory. */
+function providerCatalog(ctx) {
+  const llm = ctx !== undefined && ctx !== null ? ctx.get('llm') : undefined;
+  if (llm === undefined || llm === null) return [];
+  const providers = new Map();
+  try {
+    for (const provider of llm.listProviders?.() ?? []) {
+      if (provider !== null && provider !== undefined && typeof provider.id === 'string' && provider.id !== '') {
+        providers.set(provider.id, { id: provider.id, name: provider.name || provider.id });
+      }
+    }
+  } catch { /* a provider list that throws must not take the page down */ }
+  try {
+    for (const entry of llm.listConfigurableProviders?.() ?? []) {
+      if (entry !== null && entry !== undefined && typeof entry.provider === 'string' && entry.provider !== ''
+        && !providers.has(entry.provider)) {
+        providers.set(entry.provider, { id: entry.provider, name: entry.displayName || entry.provider });
+      }
+    }
+  } catch { /* same: the directory is advisory */ }
+  return [...providers.values()].sort((a, b) => a.id.localeCompare(b.id));
+}
+
+/** Models for one provider, plus the reasoning efforts the selected model accepts (when known). */
+async function modelCatalog(ctx, provider, model) {
+  const llm = ctx !== undefined && ctx !== null ? ctx.get('llm') : undefined;
+  if (llm === undefined || llm === null || provider === '') return { models: [], efforts: [] };
+  let models = [];
+  try {
+    models = (await llm.listModels(provider)) ?? [];
+  } catch { models = []; }
+  let efforts = [];
+  let defaultEffort;
+  if (model !== '') {
+    try {
+      const info = await llm.resolveModelInfo(provider, model);
+      efforts = info?.reasoning?.efforts ?? [];
+      defaultEffort = info?.reasoning?.defaultEffort;
+    } catch { efforts = []; }
+  }
+  return {
+    models: models.map((item) => ({ id: item.id, name: item.name || item.id })),
+    efforts: efforts.map((item) => ({
+      id: item.id,
+      name: item.name || item.id,
+      ...(typeof item.description === 'string' ? { description: item.description } : {}),
+    })),
+    ...(defaultEffort === undefined ? {} : { defaultEffort }),
+  };
+}
+
+/** The profile row this plugin's config lives in, or null when the profile cannot be edited. */
+function configEntry(ctx) {
+  try {
+    const editor = ctx !== undefined && ctx !== null ? ctx.get('configEditor') : undefined;
+    if (editor === undefined || editor === null || typeof editor.edit !== 'function') return null;
+    if (typeof editor.entries !== 'function') return null;
+    return editor.entries().find((entry) => entry !== null && entry !== undefined
+      && entry.options !== undefined && entry.options.name === PACKAGE_NAME) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -747,7 +993,7 @@ export function apply(ctx, config) {
   // Where a level -> route policy belongs: the row that wants a different one states it, and the
   // built-in table stays the default the experiment measures.
   const table = { ...ROUTE_TABLE, ...(cfg.routes || {}) };
-  const tiers = { ...TIER_TABLE, ...(cfg.tiers || {}) };
+  const tiers = effectiveTiers(cfg);
   // `{ global: true }` covers every session in the process, which is what the experiment's arm
   // selector needs at the host plane. A preset row is already scoped to its own agents and must NOT
   // be global -- that would let one Auto session re-route another session's requests.
@@ -802,6 +1048,9 @@ export function apply(ctx, config) {
       : `cycling ${schedule.length} arms per request: ${schedule.map(routeLabel).join(' | ')}`);
   }
   if (respectExplicit) log('deferring to any request that already names a reasoning effort');
+  // The plugin page's tier editor (provider/model/effort per tier). Registered for every mode: the
+  // page is also where a user turns routing on and picks its targets before any judgment runs.
+  installConfigRoute(ctx, cfg);
 
   // Request index per session, so a cycle is per session rather than per process: concurrent runs
   // would otherwise share one counter and land on unpredictable arms.

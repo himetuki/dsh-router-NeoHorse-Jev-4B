@@ -89,6 +89,20 @@ window.__ModuleLoader__.load({
 .routerLayaTime{opacity:.55;font-variant-numeric:tabular-nums;flex:none}
 .routerLayaTask{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
 .routerLayaWhy{opacity:.6;flex:none}
+.routerNeoTierEditor{font-size:12px;line-height:18px;text-align:left}
+.routerNeoHint{opacity:.72;margin:0 0 8px}
+.routerNeoTable{border-collapse:collapse;width:100%}
+.routerNeoTable th{font-weight:600;opacity:.7;text-align:left;padding:3px 6px;font-size:11px}
+.routerNeoTable td{padding:3px 6px;vertical-align:middle}
+.routerNeoTable select{max-width:260px;width:100%;box-sizing:border-box;font-size:12px;padding:2px 4px;
+  border-radius:6px;border:1px solid var(--dsw-alias-border-l1);
+  background:var(--dsw-alias-bg-layer-3,transparent);color:var(--dsw-alias-label-primary)}
+.routerNeoActions{display:flex;align-items:center;gap:8px;margin-top:10px}
+.routerNeoButton{font-size:12px;padding:4px 10px;border-radius:7px;cursor:pointer;
+  border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-primary)}
+.routerNeoButton:disabled{opacity:.5;cursor:default}
+.routerNeoStatus{opacity:.85}
+.routerNeoError{color:#f85149}
 `
 
     // ── shared poll state: server owns the truth (spec §6 constraint 2) ──────────────────────────
@@ -410,6 +424,204 @@ window.__ModuleLoader__.load({
       }, chip, toastNode, popoverNode)
     }
 
+    // ── plugin-page tier editor: provider / model / effort per tier ───────────────────────────────
+    //
+    // Registered into the plugin manager's `plugins.bundle.config` slot, keyed by the package name --
+    // that key is what makes the manager treat this bundle as "configured" and render the section on
+    // the plugin's page. A static client bundle has no `host.call`, so the data and the write both go
+    // through the host half's same-origin routes.
+    const CONFIG_URL = "/router-neohorse/config"
+    const CATALOG_URL = "/router-neohorse/catalog"
+    const PACKAGE_KEY = "dsh-router-neohorse"
+    const TIER_ROWS = [
+      { key: "low", label: "低档" },
+      { key: "high", label: "高档" },
+      { key: "max", label: "MAX" },
+      { key: "fallback", label: "兜底" },
+    ]
+    const EMPTY_TIER = { provider: "", model: "", effort: "" }
+
+    function tierOf(tiers, key) {
+      const tier = tiers === null || typeof tiers !== "object" ? null : tiers[key]
+      if (tier === null || typeof tier !== "object") return { provider: "", model: "", effort: "" }
+      return { provider: tier.provider || "", model: tier.model || "", effort: tier.effort || "" }
+    }
+
+    /** The tiers the page saves: only rows naming both a provider and a model become overrides. */
+    function savableTiers(tiers) {
+      const out = {}
+      for (const row of TIER_ROWS) {
+        const tier = tierOf(tiers, row.key)
+        if (tier.provider !== "" && tier.model !== "") {
+          out[row.key] = { provider: tier.provider, model: tier.model, effort: tier.effort }
+        }
+      }
+      return out
+    }
+
+    function optionList(entries, selected, placeholder) {
+      const options = [React.createElement("option", { key: "", value: "" }, placeholder)]
+      const ids = []
+      for (const entry of entries) {
+        ids.push(entry.id)
+        options.push(React.createElement("option", { key: entry.id, value: entry.id },
+          entry.name === entry.id ? entry.id : entry.name + "（" + entry.id + "）"))
+      }
+      if (selected !== "" && !ids.includes(selected)) {
+        options.push(React.createElement("option", { key: selected, value: selected }, selected + "（当前值）"))
+      }
+      return options
+    }
+
+    function ConfigPage() {
+      const [loading, setLoading] = React.useState(true)
+      const [writable, setWritable] = React.useState(false)
+      const [tiers, setTiers] = React.useState(null)
+      const [providers, setProviders] = React.useState([])
+      const [models, setModels] = React.useState({})
+      const [efforts, setEfforts] = React.useState({})
+      const [saving, setSaving] = React.useState(false)
+      const [saved, setSaved] = React.useState("")
+      const [error, setError] = React.useState("")
+
+      const loadCatalog = React.useCallback((provider, model) => {
+        if (provider === "") return
+        const url = CATALOG_URL + "?provider=" + encodeURIComponent(provider)
+          + (model === "" ? "" : "&model=" + encodeURIComponent(model))
+        fetch(url, { cache: "no-store" })
+          .then((res) => (res.ok ? res.json() : null))
+          .then((json) => {
+            if (json === null) return
+            setModels((prev) => ({ ...prev, [provider]: json.models || [] }))
+            setEfforts((prev) => ({ ...prev, [provider + "|" + model]: json.efforts || [] }))
+          })
+          .catch(() => { /* a failed catalog fetch leaves the row editable by hand */ })
+      }, [])
+
+      React.useEffect(() => {
+        let live = true
+        fetch(CONFIG_URL, { cache: "no-store" })
+          .then((res) => (res.ok ? res.json() : Promise.reject(new Error("HTTP " + String(res.status)))))
+          .then((json) => {
+            if (!live) return
+            const next = json.tiers || {}
+            setTiers(next)
+            setProviders(Array.isArray(json.providers) ? json.providers : [])
+            setWritable(json.writable === true)
+            setLoading(false)
+            for (const row of TIER_ROWS) {
+              const tier = tierOf(next, row.key)
+              if (tier.provider !== "") loadCatalog(tier.provider, tier.model)
+            }
+          })
+          .catch((failure) => {
+            if (!live) return
+            setError(String(failure && failure.message ? failure.message : failure))
+            setLoading(false)
+          })
+        return () => { live = false }
+      }, [loadCatalog])
+
+      const setTier = (key, patch) => {
+        setTiers((prev) => {
+          const next = { ...(prev || {}) }
+          next[key] = { ...tierOf(prev, key), ...patch }
+          return next
+        })
+        setSaved("")
+      }
+
+      const changeProvider = (key, provider) => {
+        setTier(key, { provider, model: "", effort: "" })
+        if (provider !== "") loadCatalog(provider, "")
+      }
+
+      const changeModel = (key, model) => {
+        const current = tierOf(tiers, key)
+        setTier(key, { model, effort: "" })
+        if (current.provider !== "") loadCatalog(current.provider, model)
+      }
+
+      const save = () => {
+        setSaving(true)
+        setSaved("")
+        setError("")
+        fetch(CONFIG_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ tiers: savableTiers(tiers) }),
+        })
+          .then(async (res) => {
+            const json = await res.json().catch(() => null)
+            if (!res.ok) throw new Error(json && json.error ? json.error : "HTTP " + String(res.status))
+            if (json && json.tiers) setTiers(json.tiers)
+            setSaved("已保存，下一轮生效")
+          })
+          .catch((failure) => setError(String(failure && failure.message ? failure.message : failure)))
+          .finally(() => setSaving(false))
+      }
+
+      if (loading) return React.createElement("p", { className: "routerNeoHint" }, "正在读取插件配置…")
+
+      const rows = TIER_ROWS.map(({ key, label }) => {
+        const tier = tierOf(tiers, key)
+        const modelList = tier.provider === "" ? [] : (models[tier.provider] || [])
+        const effortList = tier.provider === "" || tier.model === ""
+          ? [] : (efforts[tier.provider + "|" + tier.model] || [])
+        return React.createElement("tr", { key }, [
+          React.createElement("td", { key: "label" }, label),
+          React.createElement("td", { key: "provider" }, React.createElement("select", {
+            value: tier.provider,
+            disabled: saving || !writable,
+            onChange: (event) => changeProvider(key, event.target.value),
+          }, optionList(providers, tier.provider, "（内置默认）"))),
+          React.createElement("td", { key: "model" }, React.createElement("select", {
+            value: tier.model,
+            disabled: saving || !writable || tier.provider === "",
+            onChange: (event) => changeModel(key, event.target.value),
+          }, optionList(modelList, tier.model, tier.provider === "" ? "（内置默认）" : "选择模型…"))),
+          React.createElement("td", { key: "effort" }, React.createElement("select", {
+            value: tier.effort,
+            disabled: saving || !writable || tier.model === "",
+            onChange: (event) => setTier(key, { effort: event.target.value }),
+          }, optionList(effortList, tier.effort, effortList.length === 0 ? "适配器默认" : "跟随模型默认"))),
+        ])
+      })
+
+      return React.createElement("div", { className: "routerNeoTierEditor" }, [
+        React.createElement("p", { className: "routerNeoHint", key: "hint" },
+          "按档位指定供应商与模型（可跨供应商）；effort 留空表示用适配器默认值。"
+          + "判定由基元律动 NeoHorse-Jev-4B 给出档位，再按该表路由主模型。"),
+        React.createElement("table", { className: "routerNeoTable", key: "table" }, [
+          React.createElement("thead", { key: "head" }, React.createElement("tr", null, [
+            React.createElement("th", { key: "a" }, "档位"),
+            React.createElement("th", { key: "b" }, "供应商"),
+            React.createElement("th", { key: "c" }, "模型"),
+            React.createElement("th", { key: "d" }, "思考档位 effort"),
+          ])),
+          React.createElement("tbody", { key: "body" }, rows),
+        ]),
+        React.createElement("div", { className: "routerNeoActions", key: "actions" }, [
+          React.createElement("button", {
+            key: "save", className: "routerNeoButton", disabled: saving || !writable, onClick: save,
+          }, saving ? "保存中…" : "保存"),
+          React.createElement("button", {
+            key: "reset",
+            className: "routerNeoButton",
+            disabled: saving || !writable,
+            onClick: () => {
+              setTiers({ low: { ...EMPTY_TIER }, high: { ...EMPTY_TIER }, max: { ...EMPTY_TIER }, fallback: { ...EMPTY_TIER } })
+              setSaved("")
+            },
+          }, "恢复内置默认"),
+          saved === "" ? null : React.createElement("span", { key: "saved", className: "routerNeoStatus" }, saved),
+          error === "" ? null : React.createElement("span", { key: "error", className: "routerNeoStatus routerNeoError" }, error),
+        ]),
+        writable ? null : React.createElement("p", { className: "routerNeoHint", key: "readonly" },
+          "当前 profile 没有可编辑的插件行，此页只能查看。"),
+      ])
+    }
+
     function apply(ctx) {
       if (styleEl === null) {
         styleEl = document.createElement("style")
@@ -428,6 +640,12 @@ window.__ModuleLoader__.load({
         (slotProps) => React.createElement(Chip, {
           sessionId: slotProps === undefined || slotProps === null ? undefined : slotProps.sessionId,
         }),
+      ))
+      // The plugin page's tier editor. The `key` is the package name: the manager renders this
+      // section on that bundle's page only when a slot entry carries exactly that key.
+      ctx.slots.inject("plugins.bundle.config", () => ctx.slots.register(
+        { name: "plugins.bundle.config", key: PACKAGE_KEY },
+        ConfigPage,
       ))
     }
 
